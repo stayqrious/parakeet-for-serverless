@@ -1,0 +1,8 @@
+{
+  "input": {
+    "audios": [
+      "https://github.com/runpod-workers/sample-inputs/raw/main/audio/gettysburg.wav"
+    ],
+    "timestamps": true
+  }
+}
