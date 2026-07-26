@@ -147,6 +147,61 @@ fails: the image `CMD` is still `handler.py`, `handler.py` and
 pod's `dockerStartCmd` selects it, and the RunPod GitHub integration keeps
 building the serverless image as before.
 
+### Pod-mode env
+
+| Env | Default | Notes |
+| --- | --- | --- |
+| `POD_AUTH_TOKEN` | unset | **Set this.** When set, `/run`, `/status`, `/requests` and `DELETE` require `Authorization: Bearer <token>`; `/health` stays open so a readiness poller needs no secret. The pod proxy URL is public and unauthenticated, and `/run` makes the pod fetch caller-supplied URLs on a paid GPU. |
+| `MAX_RETAINED_RESULTS` | 32 | Hard ceiling on retained terminal outputs, oldest evicted first. Word timestamps for one 450-file batch are tens of MB of Python objects, so age alone is not a bound. |
+| `RESULT_TTL_S` | 21600 | Age limit for the same. |
+| `MAX_BODY_BYTES` | 8388608 | Request-body cap; a 500-file job body is ~150KB. |
+| `PORT` | 8000 | Must match the pod's exposed `ports` entry. |
+
+### Startup time
+
+`/health` reports the boot breakdown so provisioning can be budgeted from
+measurement rather than guesswork:
+
+```json
+{"ready": true, "boot": {"engine_load_s": 41.3, "ready_s": 43.0}}
+```
+
+`ready_s` is measured from process start, so **(pod time-to-ready) −
+`ready_s` = RunPod scheduling + image pull**. Measure that split before
+optimizing anything: for a ~12GB image the pull is expected to dominate,
+and every other lever is small by comparison.
+
+Ranked levers, most effective first:
+
+1. **Take boot off the critical path.** Create the pod at the *start* of
+   the caller's prep work rather than when the first batch is ready — the
+   whole pull+load overlaps with work that had to happen anyway. Costs
+   nothing and needs no image change. This is the single biggest win.
+2. **One pod for all of the day's batches** (already the design): the pull
+   is paid once per day, not once per batch.
+3. **Shrink the image**, since pull time scales with it. The build now
+   prints the 15 largest `site-packages` entries — read that from the
+   Actions log before cutting anything. `nemo_toolkit[asr]` pulls a
+   training-oriented dependency tree, so there is likely dead weight, but
+   trimming it needs a real transcription run to validate.
+4. **zstd layer compression** (`compression=zstd` on
+   `docker/build-push-action`) decompresses several times faster than gzip,
+   and pull is often decompression-bound rather than network-bound. Publish
+   it under a separate tag and confirm the pod host accepts zstd before
+   switching the default.
+5. **Split the single large pip layer** into 2–3 layers: Docker pulls 3
+   layers concurrently, so one 5GB layer is a single-stream bottleneck.
+   Speculative, and risks pip resolving different versions per layer —
+   measure the pull split first.
+6. `HF_HUB_OFFLINE=1` is baked, so boot no longer round-trips to
+   huggingface.co for a revision check. A build-time assertion proves the
+   weights still resolve offline.
+
+Engine-side options (would require changing `parakeet_engine.py`, which is
+frozen — listed for completeness): load weights directly to GPU via
+`map_location`, and pre-extract the `.nemo` archive at build time so boot
+skips a ~2.5GB tar extraction.
+
 ## Lane configuration
 
 Duration-bucketed batching (attention memory ~ batch x duration^2; files

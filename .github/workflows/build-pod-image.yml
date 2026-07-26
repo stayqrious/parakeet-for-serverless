@@ -22,19 +22,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # REQUIRED. Standard runners ship ~14GB free; this image needs far more
-      # (pytorch+CUDA base, nemo_toolkit[asr], a baked 2.5GB model, ~12GB final).
-      # Without this the build fails with "no space left on device".
+      # REQUIRED. Standard runners ship ~25GB free; this build needs far more
+      # (pytorch+CUDA base, nemo_toolkit[asr], a baked 2.5GB model, ~12GB final
+      # image). Without this the build fails with "no space left on device".
+      #
+      # Done inline rather than with a third-party action: this job holds a
+      # GITHUB_TOKEN with packages:write, so any action it runs can push an
+      # image under our name. Removing the dependency removes that trust.
+      # Only runner-provided toolchains are deleted -- nothing the build uses.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-          docker-images: false
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/powershell \
+                      /usr/local/lib/node_modules /usr/local/graalvm \
+                      /usr/share/swift /opt/hostedtoolcache || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          df -h / | tail -1
 
       - uses: actions/checkout@v4
 
