@@ -24,6 +24,8 @@ RUN python -c "import nemo.collections.asr as a; \
     a.models.ASRModel.from_pretrained(model_name='nvidia/parakeet-tdt-0.6b-v2')"
 
 WORKDIR /app
-COPY parakeet_engine.py handler.py ./
+# server.py is the pod-mode entry point; it is inert on serverless (handler.py
+# is still the image CMD). Pods select it with RunPod's dockerStartCmd.
+COPY parakeet_engine.py handler.py server.py ./
 
 CMD ["python", "-u", "handler.py"]
