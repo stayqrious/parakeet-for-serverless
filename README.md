@@ -73,8 +73,10 @@ Per-file result:
 
 Serverless bills a standby fee on top of GPU time — it is a substantial share of total spend.
 That fee buys ~10 hosts keeping the 12GB image warm: real value for
-latency-sensitive traffic, poor value for a once-daily batch. A serverless
-day cost a large bill a comparable pod day cost $2.13.
+latency-sensitive traffic, poor value for a once-daily batch. Serverless day cost is modest; the structural problem is not the daily total
+but that ~60% of every dollar is standby, not compute. Pod mode pays only
+for GPU actually used, so it removes that 60% at the cost of one boot per
+day.
 
 So a batch caller can instead start **one pod**, run every batch against
 it, and terminate it. `server.py` is that surface — a stdlib-only
@@ -201,19 +203,29 @@ Image is **6.19GB compressed** (the ~12GB figure elsewhere is
 | `nemo_toolkit[asr]` + deps | 0.43GB | 7% |
 | ffmpeg, `server.py`, metadata | 0.19GB | 3% |
 
-**The conclusion this data forces: startup is already a rounding error for
-a once-daily batch, and further slimming is not worth engineering time.**
-A full day is ~334 audio-hours ≈ 65 min of GPU. Even taking the slow boot
-(211s), that is ~5% of pod time — about $0.012/day on a 24GB community
-card, and halving the pull would save a fraction of a cent per day. The win was never boot
-time; it was dropping the serverless standby fee (a large daily bill since pull time swings 10x on host luck, image-side tuning cannot even
-be measured reliably at this scale.
+**Boot is a large fraction of pod time, but a small number of cents.** Both
+things are true and they pull in opposite directions, so be careful which
+one you are optimizing.
+
+A small daily batch is a few audio-hours. At ~306x that is
+**~3.6 min of GPU for a normal day**, so a boot of 0.7–3.5 min is **16–49%
+of pod time**, not the rounding error a backlog run suggests.
+
+In money, though, it is still tiny: 3.6 min of work plus boot is ~4–7 min of
+pod time, i.e. **a fraction of a cent per day.05–0.08
+on a Secure 4090. Halving the pull saves well under a cent a day. And since
+pull time swung 10x on host luck between two identical runs, image-side
+tuning cannot even be measured reliably at this volume.
+
+So: worth removing boot *repetition* (below), not worth further engineering
+on boot *duration*.
 
 What is worth doing, in order:
 
-1. **One pod for all of the day's batches** — already the design. This is
-   the only startup lever with real money in it, because it pays the boot
-   once instead of ~20 times.
+1. **One pod for all of the day's batches** — already the design, and the
+   only startup lever that matters. On a normal day boot is 16–49% of pod
+   time, so paying it once instead of once per batch is the whole game. If
+   the caller ever provisions per batch, boot would dominate the bill.
 2. **Use the zstd tags.** Level-10 zstd is **5.06GB vs 6.19GB gzip, 18%
    fewer bytes**, because it compresses the torch/CUDA base far better
    (3.28 → 2.30GB); the model layer barely moves, as compressed weights do
@@ -236,8 +248,8 @@ Deliberately **not** done, with reasons:
 - **fp16/bf16 model weights** — the largest remaining lever by far (~18% of
   the pull, since the `.nemo` holds fp32 weights: 0.6B × 4 bytes ≈ 2.4GB).
   Needs `parakeet_engine.py` to `restore_from` a converted local archive,
-  which is frozen, and a WER check against the validated baseline. Not
-  worth it at a fraction of a cent per day.
+  which is frozen, and a WER check against the validated baseline. Not worth
+  it for a sub-cent daily saving.
 - **A slimmer base image.** 53% of the pull, but it is the validated
   torch 2.6+cu124 environment, and `nvidia/cuda` + pip torch is likely a
   wash since cu124 wheels bundle their own CUDA libs.
@@ -249,9 +261,9 @@ At test time **no 24GB-class community GPU was available** — two
 have the resources to deploy your pod"*, and the pod only scheduled on
 `SECURE` (RTX 4090, $0.69/hr). A daily job that requests one GPU type on
 community will simply fail to provision. Give the caller a fallback ladder:
-several community GPU types first, then Secure Cloud. Even at Secure 4090
-pricing a full day is ~$0.79 against serverless's a large bill so falling back
-is much better than not running.
+several community GPU types first, then Secure Cloud. Secure pricing still
+lands far under the serverless bill for the same work, so falling back is
+much better than not running.
 
 ## Lane configuration
 
