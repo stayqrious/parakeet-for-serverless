@@ -62,8 +62,9 @@ jobs:
             type=semver,pattern={{version}}
 
       # Deliberately no layer caching: type=gha caps at 10GB per repo and this
-      # image exceeds that, so caching would thrash and slow the build. Builds
-      # are once-per-commit and free, so ~25 min of wall time is acceptable.
+      # image exceeds that, so caching would thrash and slow the build. Build
+      # wall time is not a constraint here -- pod pull time is, because a pod
+      # is billed from allocation, pull included.
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -71,3 +72,42 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
+
+      # zstd decompresses several times faster than gzip and a large pull is
+      # often decompression-bound rather than network-bound, so this can cut
+      # billed boot time. Published under SEPARATE tags, and allowed to fail:
+      # the default tags stay gzip until a real pod proves its host Docker
+      # accepts zstd layers (an older daemon rejects the media type).
+      - name: Push zstd-compressed variant
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:zstd-latest
+            ghcr.io/${{ github.repository }}:zstd-sha-${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          outputs: type=image,compression=zstd,compression-level=10,force-compression=true
+
+      # Runs last on purpose: the pull cost we are optimizing is exactly these
+      # numbers, and putting them at the end of the job means they are readable
+      # from the log tail without downloading the whole build output.
+      - name: Image size report
+        if: always()
+        run: |
+          cat > /tmp/report.py <<'PY'
+          import json, sys
+          m = json.load(sys.stdin)
+          ls = m.get("layers", [])
+          print(f"  layers={len(ls)}  total_compressed={sum(l['size'] for l in ls)/1e9:.2f} GB")
+          for l in sorted(ls, key=lambda x: -x["size"])[:8]:
+              print(f"    {l['size']/1e9:6.2f} GB  {l['mediaType'].split('.')[-1]}")
+          PY
+          for t in sha-${{ github.sha }} zstd-sha-${{ github.sha }}; do
+            echo "=== ghcr.io/${{ github.repository }}:$t ==="
+            docker buildx imagetools inspect --raw \
+              "ghcr.io/${{ github.repository }}:$t" 2>/dev/null \
+              | python3 /tmp/report.py || echo "  (tag not published)"
+          done

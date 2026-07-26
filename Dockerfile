@@ -14,13 +14,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Deps, then two startup-cost measures, all in ONE layer on purpose:
+#  - Prune packaged test suites. Image bytes are billed GPU-seconds, because a
+#    pod pulls its image after the GPU is allocated. The deletion must happen
+#    in the same layer as the install: an rm in a later layer leaves the bytes
+#    in this one and shrinks nothing. Only "tests" is removed -- "testing" is a
+#    real imported subpackage in numpy and sympy. The model load in the next
+#    layer re-validates the pruned tree, so a bad prune fails the build.
+#  - Precompile bytecode so no boot pays to write .pyc.
+# The freeze and du output are read from the build log to decide the next round
+# of slimming (and to pin a future split-layer build).
 RUN pip install "nemo_toolkit[asr]" runpod requests && \
     python -c "import torch; assert torch.__version__.startswith('2.6.'), \
         f'NeMo install moved torch to {torch.__version__} -- pin broken'" && \
-    echo "--- installed size (image size drives pod pull time) ---" && \
-    du -sh /opt/conda/lib/python3*/site-packages | tail -1 && \
-    du -sh /opt/conda/lib/python3*/site-packages/* 2>/dev/null \
-      | sort -h | tail -15
+    SP="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    du -sh "$SP" | sed 's/^/[build] before prune: /' && \
+    find "$SP" -type d -name tests -prune -exec rm -rf {} + && \
+    (python -m compileall -q -j 0 "$SP" >/dev/null 2>&1 || true) && \
+    echo "[build] --- pip freeze ---" && \
+    pip freeze && \
+    echo "[build] --- largest site-packages entries ---" && \
+    du -sh "$SP" | sed 's/^/[build] after prune: /' && \
+    du -sh "$SP"/* 2>/dev/null | sort -h | tail -20
 
 # Bake the model (~2.5GB): nothing to download at boot,
 # and extraction headroom is paid at build time, not on a live worker disk.
