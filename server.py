@@ -7,7 +7,7 @@ either surface by changing only the base URL:
   POST   /run           -> {"id", "status": "IN_QUEUE"}         (non-blocking)
   GET    /status/<id>   -> {"id", "status", "output"?}          (404 if unknown)
   GET    /requests      -> {"requests": [{"id", "status"}, ...]}
-  GET    /health        -> {"ready", "jobs", "workers", ...}
+  GET    /health        -> {"ready", "jobs", "workers", "boot", ...}
   DELETE /status/<id>   -> {"deleted": true}
 
 One GPU => exactly one worker thread drains a FIFO queue. ParakeetEngine is not
@@ -21,8 +21,13 @@ this file via RunPod's dockerStartCmd:
 
 Stdlib only by design — the image installs nemo_toolkit[asr], runpod and
 requests and nothing else, so there is no FastAPI/uvicorn here.
+
+Set POD_AUTH_TOKEN to require a bearer token: a pod's HTTP port is published at
+https://{podId}-8000.proxy.runpod.net with no authentication of its own, and
+/run makes this process fetch caller-supplied URLs on a paid GPU.
 """
 
+import hmac
 import json
 import os
 import queue
@@ -32,6 +37,8 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_T_START = time.time()
 
 # No core dumps: a crash of a ~40GB process must not fill container disk.
 # (Same guard as handler.py — learned on the A40 pod.)
@@ -44,12 +51,27 @@ MAX_FILES_PER_JOB = int(os.environ.get("MAX_FILES_PER_JOB", 500))
 # How long a terminal job's output is retained for collection. Generous: the
 # caller polls every ~30s and may be mid-batch. Eviction is lazy.
 RESULT_TTL_S = int(os.environ.get("RESULT_TTL_S", 6 * 3600))
+# ...but TTL alone is not a bound. Word+segment timestamps for one 450-file
+# batch run to tens of MB of Python objects, and a production day is ~8k
+# files, so a 6h window would accumulate the whole day in RAM next to a
+# ~15GB engine process. Keep a hard ceiling on retained terminal outputs.
+MAX_RETAINED_RESULTS = int(os.environ.get("MAX_RETAINED_RESULTS", 32))
+# Optional caller credential. Unset (default) keeps the open contract.
+# /health stays open either way so a readiness poller needs no secret.
+AUTH_TOKEN = os.environ.get("POD_AUTH_TOKEN", "").strip()
+# Bound the request buffer: Content-Length is attacker-controlled and a
+# 500-file job body is ~150KB.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 8 << 20))
 
 _JOBS = {}                      # job_id -> {"status", "output", "created", "finished"}
 _LOCK = threading.Lock()
 _QUEUE = queue.Queue()
 _READY = threading.Event()
 _LOAD_ERROR = None              # set if the engine never reaches VRAM
+_WORKER = None                  # thread handle, for liveness reporting
+# Boot cost breakdown, so the caller can budget provisioning instead of
+# guessing: (time to ready) - engine_load_s = scheduling + image pull.
+BOOT = {"engine_load_s": None, "ready_s": None}
 ENGINE = None
 
 
@@ -68,18 +90,51 @@ def _normalize(audios):
     return items
 
 
-def _evict_expired():
+def _evict():
+    """Bound retained results by age AND by count (see MAX_RETAINED_RESULTS).
+    Only terminal jobs are eligible — a queued job has finished=None."""
     now = time.time()
     with _LOCK:
         for jid in [j for j, v in _JOBS.items()
                     if v.get("finished") and now - v["finished"] > RESULT_TTL_S]:
             del _JOBS[jid]
+        terminal = sorted((v["finished"], j) for j, v in _JOBS.items()
+                          if v.get("finished"))
+        for _, jid in terminal[:max(0, len(terminal) - MAX_RETAINED_RESULTS)]:
+            del _JOBS[jid]
+
+
+def _run_job(job_id, items, timestamps):
+    with _LOCK:
+        if job_id not in _JOBS:      # cancelled before it started
+            return
+        _JOBS[job_id]["status"] = "IN_PROGRESS"
+    print(f"[server] job {job_id}: START ({len(items)} files)", flush=True)
+    try:
+        result = ENGINE.transcribe(items, timestamps=timestamps)
+        result["results"] = result.pop("files")
+        result["success"] = True
+        status = "COMPLETED"
+    except Exception as e:
+        # Job-level failure only. Per-file errors are already isolated
+        # inside the engine and surface as an "error" key per result.
+        import traceback
+        traceback.print_exc()
+        result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+        status = "FAILED"
+    with _LOCK:
+        if job_id in _JOBS:
+            _JOBS[job_id].update(status=status, output=result,
+                                 finished=time.time())
+    print(f"[server] job {job_id}: {status}", flush=True)
+    _evict()
 
 
 def _worker():
     """Single consumer. Serializes all GPU work."""
     global ENGINE, _LOAD_ERROR
     print("[server] loading engine ...", flush=True)
+    t = time.time()
     try:
         ENGINE = ParakeetEngine()
     except Exception as e:
@@ -91,36 +146,25 @@ def _worker():
         _LOAD_ERROR = f"{type(e).__name__}: {e}"
         print(f"[server] FATAL: engine load failed: {_LOAD_ERROR}", flush=True)
         return
+    BOOT["engine_load_s"] = round(time.time() - t, 1)
+    BOOT["ready_s"] = round(time.time() - _T_START, 1)
     _READY.set()
-    print("[server] engine ready; listening for jobs", flush=True)
+    print(f"[server] engine ready in {BOOT['engine_load_s']}s "
+          f"({BOOT['ready_s']}s since process start); listening for jobs",
+          flush=True)
 
     while True:
         job_id, items, timestamps = _QUEUE.get()
-        with _LOCK:
-            if job_id not in _JOBS:      # cancelled before it started
-                _QUEUE.task_done()
-                continue
-            _JOBS[job_id]["status"] = "IN_PROGRESS"
-        print(f"[server] job {job_id}: START ({len(items)} files)", flush=True)
         try:
-            result = ENGINE.transcribe(items, timestamps=timestamps)
-            result["results"] = result.pop("files")
-            result["success"] = True
-            status = "COMPLETED"
-        except Exception as e:
-            # Job-level failure only. Per-file errors are already isolated
-            # inside the engine and surface as an "error" key per result.
+            _run_job(job_id, items, timestamps)
+        except Exception:
+            # This thread is the only consumer: if it dies, every later job
+            # sits IN_QUEUE forever while /health still says ready. Bookkeeping
+            # or eviction must never end the loop.
             import traceback
             traceback.print_exc()
-            result = {"success": False, "error": f"{type(e).__name__}: {e}"}
-            status = "FAILED"
-        with _LOCK:
-            if job_id in _JOBS:
-                _JOBS[job_id].update(status=status, output=result,
-                                     finished=time.time())
-        print(f"[server] job {job_id}: {status}", flush=True)
-        _QUEUE.task_done()
-        _evict_expired()
+        finally:
+            _QUEUE.task_done()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,15 +181,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        """True when no token is configured (open contract) or the caller
+        presents it. Constant-time compare."""
+        if not AUTH_TOKEN:
+            return True
+        got = self.headers.get("Authorization") or ""
+        prefix = "Bearer "
+        if not got.startswith(prefix):
+            return False
+        return hmac.compare_digest(got[len(prefix):].strip(), AUTH_TOKEN)
+
     def _read_body(self):
         """Always drain the request body before replying. Under HTTP/1.1
         keep-alive an undrained body is parsed as the next request line, so a
         requests.Session that gets an early 503/404 on /run would see garbage
-        on its next call."""
+        on its next call. Returns None when the body cannot be safely drained
+        (oversized or chunked) — the caller must then close the connection."""
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            return None
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            return b""
+            return None
+        if n > MAX_BODY_BYTES:
+            return None
         return self.rfile.read(n) if n > 0 else b""
 
     # ---------------- GET ----------------
@@ -156,6 +216,7 @@ class Handler(BaseHTTPRequestHandler):
                 for v in _JOBS.values():
                     counts[v["status"]] = counts.get(v["status"], 0) + 1
             ready = _READY.is_set()
+            alive = bool(_WORKER and _WORKER.is_alive())
             payload = {
                 "ready": ready,
                 "model": os.environ.get("PARAKEET_MODEL",
@@ -165,11 +226,16 @@ class Handler(BaseHTTPRequestHandler):
                          "completed": counts.get("COMPLETED", 0),
                          "failed": counts.get("FAILED", 0)},
                 "workers": {"ready": 1 if ready else 0,
-                            "running": counts.get("IN_PROGRESS", 0)},
+                            "running": counts.get("IN_PROGRESS", 0),
+                            "alive": alive},
+                "boot": BOOT,
             }
             if _LOAD_ERROR:
                 payload["error"] = _LOAD_ERROR
             return self._send(200, payload)
+
+        if not self._authorized():
+            return self._send(401, {"error": "unauthorized"})
 
         if self.path.startswith("/requests"):
             with _LOCK:
@@ -193,6 +259,15 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------- POST ----------------
     def do_POST(self):
         raw = self._read_body()
+        if raw is None:
+            # Cannot drain safely, so this connection cannot be reused.
+            self.close_connection = True
+            return self._send(413, {"error": f"unsupported request body: send "
+                                             f"a Content-Length no larger "
+                                             f"than {MAX_BODY_BYTES} bytes "
+                                             f"(chunked not supported)"})
+        if not self._authorized():
+            return self._send(401, {"error": "unauthorized"})
         if not self.path.startswith("/run"):
             return self._send(404, {"error": "unknown path"})
         if not _READY.is_set():
@@ -227,7 +302,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------- DELETE ----------------
     def do_DELETE(self):
-        self._read_body()
+        if self._read_body() is None:
+            self.close_connection = True
+            return self._send(413, {"error": "unsupported request body"})
+        if not self._authorized():
+            return self._send(401, {"error": "unauthorized"})
         m = re.match(r"^/status/([^/?]+)", self.path)
         if not m:
             return self._send(404, {"error": "unknown path"})
@@ -237,9 +316,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=_worker, daemon=True).start()
+    _WORKER = threading.Thread(target=_worker, daemon=True)
+    _WORKER.start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    print(f"[server] HTTP up on 0.0.0.0:{PORT} (engine loading in background)",
-          flush=True)
+    print(f"[server] HTTP up on 0.0.0.0:{PORT} in "
+          f"{time.time() - _T_START:.1f}s (engine loading in background); "
+          f"auth {'ON' if AUTH_TOKEN else 'OFF'}", flush=True)
     srv.serve_forever()
