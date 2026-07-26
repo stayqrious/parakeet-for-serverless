@@ -169,54 +169,94 @@ measurement rather than guesswork:
 `ready_s` is measured from process start, so **(pod time-to-ready) −
 `ready_s` = RunPod scheduling + image pull**.
 
-**A pod is billed from GPU allocation, so the image pull and the model load
-are billed idle GPU time.** The quantity to minimize is therefore total
-*pod-seconds*, which has a consequence worth stating plainly: creating the
-pod earlier (so boot overlaps the caller's prep work) improves latency but
-**does not reduce cost** — it starts the meter sooner and bills the same
-boot, or more. Only three things actually reduce the bill: paying boot
-fewer times, pulling fewer bytes, and loading faster.
+A pod is billed from GPU allocation, so pull and model load are billed idle
+GPU. Note that creating the pod earlier so boot overlaps the caller's prep
+work improves *latency* but **not cost** — it starts the meter sooner.
+Likewise, pre-warming the model before answering `ready` moves the same
+seconds around inside an already-billing pod.
 
-Ranked by billed seconds saved:
+### Measured on real pods (2026-07-26, RTX 4090 Secure, `sha-c12aac2`)
 
-1. **One pod for all of the day's batches** — already the design, and by
-   far the largest effect: boot is paid once per day instead of once per
-   batch. Everything below is an optimization of that single boot.
-2. **Fewer bytes to pull.** Pull scales with image size, and for a ~12GB
-   image it should dominate the rest combined. Landed so far: packaged test
-   suites pruned in the install layer (deleting in a later layer would
-   shrink nothing). The build now logs `pip freeze` and the 20 largest
-   `site-packages` entries, and the job's last step prints per-layer
-   compressed sizes — read those before cutting anything else.
-   `nemo_toolkit[asr]` carries a training-oriented tree, so there is likely
-   more to remove, but each cut needs a real transcription run to trust:
-   the build only proves that imports and the model load survive.
-3. **zstd layer compression** — decompresses several times faster than
-   gzip, and a large pull is often decompression-bound rather than
-   network-bound. Published under `zstd-latest` / `zstd-sha-<sha>` tags,
-   with the default tags left on gzip until a pod confirms its host Docker
-   accepts zstd layers (an older daemon rejects the media type). Compare
-   the two by booting one pod on each tag and reading `boot.ready_s`
-   against total time-to-ready.
-4. **Faster load.** `HF_HUB_OFFLINE=1` is baked, so boot no longer
-   round-trips to huggingface.co for a revision check (a build-time
-   assertion proves the weights still resolve offline), and all bytecode is
-   precompiled so no boot writes `.pyc`.
-5. **Split the single large pip layer** so layers download in parallel —
-   Docker pulls 3 concurrently, so one ~5GB layer is a single-stream
-   straggler. Not landed: splitting a `pip install` across RUNs can resolve
-   different versions, so it needs the pinned `pip freeze` (now in the build
-   log) plus evidence from the per-layer report that one layer really is the
-   straggler. Do this only if the report shows it.
+Two pods, one per image variant. Both passed all 20 functional checks and
+were terminated.
 
-Note that pre-warming the model or CUDA graphs before answering `ready` is
-*not* on this list: it moves the same seconds earlier in a pod that is
-already billing, so it changes latency and not cost.
+| Phase | gzip (6.19GB) | zstd (5.06GB) |
+| --- | --- | --- |
+| pod create → `ready: true` | 210.9s | 39.3s |
+| ├─ RunPod scheduling + image pull | 190.9s | 18.8s |
+| └─ process start → ready (`boot.ready_s`) | 20.0s | 20.5s |
+| &nbsp;&nbsp;&nbsp;&nbsp;of which engine load | 20.0s | 20.4s |
 
-Engine-side options (would require changing `parakeet_engine.py`, which is
-frozen — listed for completeness): load weights directly to GPU via
-`map_location`, and pre-extract the `.nemo` archive at build time so boot
-skips a ~2.5GB tar extraction on every start.
+**Do not read that as a zstd win.** 18% fewer bytes cannot make a pull 10x
+faster; the two pods landed on different hosts and pulled at 32 MB/s and
+269 MB/s respectively. Pull time is dominated by host and network variance,
+which swamps anything the image can do about it — attributing a difference
+to compression would need repeated runs of both tags. What these runs *do*
+establish: zstd layers pull correctly on RunPod (the reason the variant was
+published behind separate tags), and engine load is a stable ~20s.
+
+Image is **6.19GB compressed** (the ~12GB figure elsewhere is
+*uncompressed*), across 10 layers:
+
+| Layer | Compressed | Share |
+| --- | --- | --- |
+| pytorch base (torch + CUDA + cuDNN) | 3.28GB | 53% |
+| baked model | 2.30GB | 37% |
+| `nemo_toolkit[asr]` + deps | 0.43GB | 7% |
+| ffmpeg, `server.py`, metadata | 0.19GB | 3% |
+
+**The conclusion this data forces: startup is already a rounding error for
+a once-daily batch, and further slimming is not worth engineering time.**
+A full day is ~334 audio-hours ≈ 65 min of GPU. Even taking the slow boot
+(211s), that is ~5% of pod time — about $0.012/day on a 24GB community
+card, and halving the pull would save ~$0.005/day. The win was never boot
+time; it was dropping the serverless standby fee ($16.38/day → ~$2.13/day).
+And since pull time swings 10x on host luck, image-side tuning cannot even
+be measured reliably at this scale.
+
+What is worth doing, in order:
+
+1. **One pod for all of the day's batches** — already the design. This is
+   the only startup lever with real money in it, because it pays the boot
+   once instead of ~20 times.
+2. **Use the zstd tags.** Level-10 zstd is **5.06GB vs 6.19GB gzip, 18%
+   fewer bytes**, because it compresses the torch/CUDA base far better
+   (3.28 → 2.30GB); the model layer barely moves, as compressed weights do
+   not recompress. Verified to pull on RunPod. Strictly fewer bytes at zero
+   runtime cost, so take it — but expect the benefit to be invisible next to
+   host variance, and do not spend time tuning it further.
+3. **Faster load** (landed, and already cheap at 20s): `HF_HUB_OFFLINE=1`
+   so boot never round-trips to huggingface.co, guarded by a build-time
+   assertion that the weights still resolve offline, plus precompiled
+   bytecode so no boot writes `.pyc`.
+
+Deliberately **not** done, with reasons:
+
+- **Splitting the pip layer for parallel download.** The premise was wrong:
+  that layer is 0.43GB (7%), not the ~5GB straggler assumed. The two layers
+  that matter are already separate and Docker pulls 3 concurrently, so the
+  parallelism is already there. No gain available.
+- **Further `site-packages` pruning.** It can only touch the 7% layer. The
+  test-suite prune that is landed is worth ~1% of the pull.
+- **fp16/bf16 model weights** — the largest remaining lever by far (~18% of
+  the pull, since the `.nemo` holds fp32 weights: 0.6B × 4 bytes ≈ 2.4GB).
+  Needs `parakeet_engine.py` to `restore_from` a converted local archive,
+  which is frozen, and a WER check against the validated baseline. Not
+  worth it at ~$0.005/day.
+- **A slimmer base image.** 53% of the pull, but it is the validated
+  torch 2.6+cu124 environment, and `nvidia/cuda` + pip torch is likely a
+  wash since cu124 wheels bundle their own CUDA libs.
+
+### Capacity, which matters more than boot time
+
+At test time **no 24GB-class community GPU was available** — two
+`COMMUNITY` attempts across 11 GPU types both returned HTTP 500 *"does not
+have the resources to deploy your pod"*, and the pod only scheduled on
+`SECURE` (RTX 4090, $0.69/hr). A daily job that requests one GPU type on
+community will simply fail to provision. Give the caller a fallback ladder:
+several community GPU types first, then Secure Cloud. Even at Secure 4090
+pricing a full day is ~$0.79 against serverless's $16.38, so falling back
+is much better than not running.
 
 ## Lane configuration
 
