@@ -167,40 +167,56 @@ measurement rather than guesswork:
 ```
 
 `ready_s` is measured from process start, so **(pod time-to-ready) −
-`ready_s` = RunPod scheduling + image pull**. Measure that split before
-optimizing anything: for a ~12GB image the pull is expected to dominate,
-and every other lever is small by comparison.
+`ready_s` = RunPod scheduling + image pull**.
 
-Ranked levers, most effective first:
+**A pod is billed from GPU allocation, so the image pull and the model load
+are billed idle GPU time.** The quantity to minimize is therefore total
+*pod-seconds*, which has a consequence worth stating plainly: creating the
+pod earlier (so boot overlaps the caller's prep work) improves latency but
+**does not reduce cost** — it starts the meter sooner and bills the same
+boot, or more. Only three things actually reduce the bill: paying boot
+fewer times, pulling fewer bytes, and loading faster.
 
-1. **Take boot off the critical path.** Create the pod at the *start* of
-   the caller's prep work rather than when the first batch is ready — the
-   whole pull+load overlaps with work that had to happen anyway. Costs
-   nothing and needs no image change. This is the single biggest win.
-2. **One pod for all of the day's batches** (already the design): the pull
-   is paid once per day, not once per batch.
-3. **Shrink the image**, since pull time scales with it. The build now
-   prints the 15 largest `site-packages` entries — read that from the
-   Actions log before cutting anything. `nemo_toolkit[asr]` pulls a
-   training-oriented dependency tree, so there is likely dead weight, but
-   trimming it needs a real transcription run to validate.
-4. **zstd layer compression** (`compression=zstd` on
-   `docker/build-push-action`) decompresses several times faster than gzip,
-   and pull is often decompression-bound rather than network-bound. Publish
-   it under a separate tag and confirm the pod host accepts zstd before
-   switching the default.
-5. **Split the single large pip layer** into 2–3 layers: Docker pulls 3
-   layers concurrently, so one 5GB layer is a single-stream bottleneck.
-   Speculative, and risks pip resolving different versions per layer —
-   measure the pull split first.
-6. `HF_HUB_OFFLINE=1` is baked, so boot no longer round-trips to
-   huggingface.co for a revision check. A build-time assertion proves the
-   weights still resolve offline.
+Ranked by billed seconds saved:
+
+1. **One pod for all of the day's batches** — already the design, and by
+   far the largest effect: boot is paid once per day instead of once per
+   batch. Everything below is an optimization of that single boot.
+2. **Fewer bytes to pull.** Pull scales with image size, and for a ~12GB
+   image it should dominate the rest combined. Landed so far: packaged test
+   suites pruned in the install layer (deleting in a later layer would
+   shrink nothing). The build now logs `pip freeze` and the 20 largest
+   `site-packages` entries, and the job's last step prints per-layer
+   compressed sizes — read those before cutting anything else.
+   `nemo_toolkit[asr]` carries a training-oriented tree, so there is likely
+   more to remove, but each cut needs a real transcription run to trust:
+   the build only proves that imports and the model load survive.
+3. **zstd layer compression** — decompresses several times faster than
+   gzip, and a large pull is often decompression-bound rather than
+   network-bound. Published under `zstd-latest` / `zstd-sha-<sha>` tags,
+   with the default tags left on gzip until a pod confirms its host Docker
+   accepts zstd layers (an older daemon rejects the media type). Compare
+   the two by booting one pod on each tag and reading `boot.ready_s`
+   against total time-to-ready.
+4. **Faster load.** `HF_HUB_OFFLINE=1` is baked, so boot no longer
+   round-trips to huggingface.co for a revision check (a build-time
+   assertion proves the weights still resolve offline), and all bytecode is
+   precompiled so no boot writes `.pyc`.
+5. **Split the single large pip layer** so layers download in parallel —
+   Docker pulls 3 concurrently, so one ~5GB layer is a single-stream
+   straggler. Not landed: splitting a `pip install` across RUNs can resolve
+   different versions, so it needs the pinned `pip freeze` (now in the build
+   log) plus evidence from the per-layer report that one layer really is the
+   straggler. Do this only if the report shows it.
+
+Note that pre-warming the model or CUDA graphs before answering `ready` is
+*not* on this list: it moves the same seconds earlier in a pod that is
+already billing, so it changes latency and not cost.
 
 Engine-side options (would require changing `parakeet_engine.py`, which is
 frozen — listed for completeness): load weights directly to GPU via
 `map_location`, and pre-extract the `.nemo` archive at build time so boot
-skips a ~2.5GB tar extraction.
+skips a ~2.5GB tar extraction on every start.
 
 ## Lane configuration
 
