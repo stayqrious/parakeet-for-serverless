@@ -1,14 +1,14 @@
 """
 handler.py — RunPod serverless entry point for the Parakeet batch engine.
 
-The engine (parakeet_engine.py) is the exact code validated on an A40 pod
-across ~625 audio-hours of real-world conversational speech (2026-07-22).
+The engine (parakeet_engine.py) is the exact code validated on an A40 GPU
+across ~625 audio-hours of real-world conversational speech.
 
 Input schema (inside "input"):
   audios       list      REQUIRED. Either plain URL strings, or objects
                          with "audio_url" plus any metadata keys
-                         (chunk_id, session_id, speaker, ...) which are
-                         passed through to the corresponding result.
+                         (id, speaker, ...) which are passed through to
+                         the corresponding result.
   timestamps   bool      include word + segment timestamps (default true)
 
 Top-level "webhook" works as with any RunPod endpoint: the full response
@@ -26,8 +26,7 @@ metadata, or an "error" string (with ffmpeg stderr) on per-file failure.
 import os
 import resource
 
-# No core dumps: a crash of a ~40GB process must not fill container disk
-# (learned the hard way on the pod).
+# No core dumps: a crash of a multi-GB process must not fill container disk.
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 import runpod  # noqa: E402

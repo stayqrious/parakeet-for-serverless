@@ -1,8 +1,12 @@
 """
-server.py — long-running HTTP server for POD-mode Parakeet transcription.
+server.py — long-running HTTP server for batch Parakeet transcription.
 
-Wire-compatible with the RunPod serverless endpoint so a caller can point at
-either surface by changing only the base URL:
+The portable entry point: stdlib only, no cloud SDK, no provider API calls. It
+binds a port and serves HTTP, so it runs on any host that can run this
+container on an NVIDIA GPU.
+
+Wire-compatible with the RunPod Serverless endpoint (handler.py) so a caller
+can point at either surface by changing only the base URL:
 
   POST   /run           -> {"id", "status": "IN_QUEUE"}         (non-blocking)
   GET    /status/<id>   -> {"id", "status", "output"?}          (404 if unknown)
@@ -14,17 +18,21 @@ One GPU => exactly one worker thread drains a FIFO queue. ParakeetEngine is not
 safe for concurrent transcribe() calls (TDT CUDA graphs, and _set_attention()
 mutates the model globally), so jobs are strictly serialized.
 
-Serverless entry point (handler.py) is untouched and still works; a pod selects
-this file via RunPod's dockerStartCmd:
+The image CMD is handler.py, so running this file means overriding the
+container command:
 
-  "dockerStartCmd": ["python", "-u", "server.py"]
+  docker run --gpus all -p 8000:8000 <image> python -u server.py
+
+On RunPod pods the equivalent is "dockerStartCmd": ["python", "-u",
+"server.py"]. The Serverless entry point is untouched either way.
 
 Stdlib only by design — the image installs nemo_toolkit[asr], runpod and
 requests and nothing else, so there is no FastAPI/uvicorn here.
 
-Set POD_AUTH_TOKEN to require a bearer token: a pod's HTTP port is published at
-https://{podId}-8000.proxy.runpod.net with no authentication of its own, and
-/run makes this process fetch caller-supplied URLs on a paid GPU.
+Set POD_AUTH_TOKEN to require a bearer token on everything except /health.
+Hosted GPU providers commonly publish a container's port on a public URL with
+no authentication of their own, and /run makes this process fetch
+caller-supplied URLs on a GPU somebody is paying for.
 """
 
 import hmac
