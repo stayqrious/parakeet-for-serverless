@@ -1,8 +1,7 @@
 # Parakeet TDT 0.6B v2 serverless worker
-# Base = the exact torch/CUDA combination validated on the A40 pod:
-# torch 2.6.0 + cu124 (satisfies NeMo's torch>=2.6 floor, so pip will NOT
-# upgrade torch during the NeMo install -- this avoids the version cascade
-# that cost an hour of pod debugging).
+# Base = the validated torch/CUDA combination: torch 2.6.0 + cu124. It
+# satisfies NeMo's torch>=2.6 floor, so pip will NOT upgrade torch during the
+# NeMo install -- that version cascade is the failure this pin prevents.
 
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
@@ -37,8 +36,9 @@ RUN pip install "nemo_toolkit[asr]" runpod requests && \
     du -sh "$SP" | sed 's/^/[build] after prune: /' && \
     du -sh "$SP"/* 2>/dev/null | sort -h | tail -20
 
-# Bake the model (~2.5GB): no network volume, no first-request bootstrap,
-# and extraction headroom is paid at build time, not on a live worker disk.
+# Bake the model (~2.5GB): nothing to download at boot, no first-request
+# bootstrap, and extraction headroom is paid at build time rather than on a
+# live worker's disk.
 # The second load asserts the weights resolve with the hub switched off, which
 # is what makes HF_HUB_OFFLINE below safe: if a future NeMo needs the network
 # to locate a cached model, this build fails instead of shipping an image that
@@ -55,8 +55,9 @@ RUN python -c "import nemo.collections.asr as a; \
 ENV HF_HUB_OFFLINE=1
 
 WORKDIR /app
-# server.py is the pod-mode entry point; it is inert on serverless (handler.py
-# is still the image CMD). Pods select it with RunPod's dockerStartCmd.
+# server.py is the portable HTTP entry point; it is inert unless selected as
+# the container command. handler.py (RunPod Serverless) stays the image CMD,
+# so a generic GPU host must override the command to run server.py.
 COPY parakeet_engine.py handler.py server.py ./
 
 CMD ["python", "-u", "handler.py"]
